@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple, Any
 
 import requests
+import pickle
 
 POKEAPI_BASE = "https://pokeapi.co/api/v2"
 
@@ -351,6 +352,15 @@ class PokemonDatabase:
         for t in defender_types:
             mult *= self.type_chart.get(move_type, {}).get(t, 1.0)
         return mult
+    
+    def save_pkl(self, path: str):
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+
+    @staticmethod
+    def load_pkl(path: str):
+        with open(path, "rb") as f:
+            return pickle.load(f)
 
 
 # =========================
