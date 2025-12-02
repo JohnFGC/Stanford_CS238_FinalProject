@@ -309,11 +309,13 @@ class PokemonDatabase:
         move_filter: Optional[str] = None,
     ) -> PokemonInstance:
         """
-        Create a PokemonInstance with stats from species_map and moves sampled from
-        legal moves in the loaded generations.
+        Create a PokemonInstance with stats from species_map and the strongest moves
+        from legal moves in the loaded generations.
+        
+        Moves are selected by power (highest first), then accuracy, then alphabetically.
 
         move_filter:
-            - None: sample any legal damaging moves
+            - None: select from any legal moves
             - "special": only special moves
             - "physical": only physical moves
         """
@@ -348,11 +350,20 @@ class PokemonDatabase:
         if not candidate_moves:
             candidate_moves = [self.move_map[name] for name in legal_move_names if name in self.move_map]
 
-        # Sample up to num_moves moves
+        # Select the strongest moves by power
         if len(candidate_moves) <= num_moves:
             chosen = candidate_moves
         else:
-            chosen = random.sample(candidate_moves, num_moves)
+            # Sort by power (descending), treating None as 0
+            # Tie-break by accuracy (higher is better), then alphabetically by name
+            candidate_moves.sort(
+                key=lambda m: (
+                    -(m.power if m.power is not None else 0),  # Highest power first
+                    -(m.accuracy if m.accuracy is not None else 0),  # Then highest accuracy
+                    m.name  # Then alphabetically
+                )
+            )
+            chosen = candidate_moves[:num_moves]
 
         return PokemonInstance(
             species=species,
@@ -462,13 +473,16 @@ class PokemonBattleEnv:
       4..(4 + num_team - 2): switch to team[index] (skipping current active)
     """
 
-    def __init__(self, db: PokemonDatabase, trainer1: TrainerState, trainer2: TrainerState):
+    def __init__(self, db: PokemonDatabase, trainer1: TrainerState, trainer2: TrainerState,
+                 policy1: Optional['Policy'] = None, policy2: Optional['Policy'] = None):
         self.db = db
         self.initial_trainer1 = trainer1
         self.initial_trainer2 = trainer2
         self.trainer1: TrainerState = None
         self.trainer2: TrainerState = None
         self.done = False
+        self.policy1 = policy1  # For forced switches
+        self.policy2 = policy2  # For forced switches
 
     def _clone_trainer(self, t: TrainerState) -> TrainerState:
         new_team = []
@@ -649,13 +663,29 @@ class PokemonBattleEnv:
                     f"Player {player_id}'s {active.species.name} fainted!"
                 )
                 if trainer.has_available_pokemon():
-                    for i, p in enumerate(trainer.team):
-                        if not p.is_fainted():
-                            trainer.active_index = i
-                            info["log"].append(
-                                f"Player {player_id} sends out {p.species.name}!"
-                            )
-                            break
+                    available = trainer.available_switch_indices()
+                    
+                    # Use policy to select which Pokemon to switch to
+                    policy = self.policy1 if player_id == 1 else self.policy2
+                    if policy is not None:
+                        obs = self._get_observation()
+                        # Adjust observation for player 2 (swap p1/p2 in obs)
+                        if player_id == 2:
+                            obs = {
+                                "p1_active": obs["p2_active"],
+                                "p2_active": obs["p1_active"],
+                                "p1_team_status": obs["p2_team_status"],
+                                "p2_team_status": obs["p1_team_status"],
+                            }
+                        switch_to = policy.select_forced_switch(obs, available)
+                    else:
+                        # Default: pick first available
+                        switch_to = available[0]
+                    
+                    trainer.active_index = switch_to
+                    info["log"].append(
+                        f"Player {player_id} sends out {trainer.team[switch_to].species.name}!"
+                    )
 
     def _compute_reward_done(self) -> Tuple[float, bool]:
         p1_alive = self.trainer1.has_available_pokemon()
@@ -681,31 +711,71 @@ class PokemonBattleEnv:
 class Policy:
     """Base class for battle policies."""
     
-    def select_action(self, obs: Dict[str, Any], valid_moves: List[Move]) -> int:
+    def select_action(self, obs: Dict[str, Any], valid_moves: List[Move], 
+                     available_switches: List[int]) -> int:
         """
-        Select an action (move index 0-3) based on observation.
+        Select an action based on observation.
+        
+        Args:
+            obs: Current battle observation with team status
+            valid_moves: List of available moves for the active Pokemon
+            available_switches: List of team indices that can be switched to
+            
+        Returns:
+            Action index:
+            - 0-3: use move at that index
+            - 4+: switch to Pokemon (action_index - 4 maps to available_switches)
+        """
+        raise NotImplementedError
+    
+    def select_forced_switch(self, obs: Dict[str, Any], 
+                            available_switches: List[int]) -> int:
+        """
+        Select which Pokemon to switch to when current one faints.
         
         Args:
             obs: Current battle observation
-            valid_moves: List of available moves for the active Pokemon
+            available_switches: List of team indices that can be switched to
             
         Returns:
-            Action index (0-3 for moves, 4+ for switches)
+            Team index to switch to
         """
-        raise NotImplementedError
+        # Default: pick first available
+        return available_switches[0] if available_switches else 0
 
 
 class RandomPolicy(Policy):
-    """Randomly selects from available moves."""
+    """Randomly selects from available moves and switches."""
     
-    def select_action(self, obs: Dict[str, Any], valid_moves: List[Move]) -> int:
-        return random.randint(0, min(3, len(valid_moves) - 1))
+    def __init__(self, switch_probability: float = 0.1):
+        """
+        Args:
+            switch_probability: Probability of switching instead of attacking
+        """
+        self.switch_probability = switch_probability
+    
+    def select_action(self, obs: Dict[str, Any], valid_moves: List[Move], 
+                     available_switches: List[int]) -> int:
+        # Randomly decide whether to switch
+        if available_switches and random.random() < self.switch_probability:
+            # Switch action: 4 + random index into available_switches
+            switch_idx = random.randint(0, len(available_switches) - 1)
+            return 4 + switch_idx
+        else:
+            # Move action
+            return random.randint(0, min(3, len(valid_moves) - 1))
+    
+    def select_forced_switch(self, obs: Dict[str, Any], 
+                            available_switches: List[int]) -> int:
+        # Randomly pick from available Pokemon
+        return random.choice(available_switches) if available_switches else 0
 
 
 class GreedyPowerPolicy(Policy):
-    """Selects the move with highest power."""
+    """Selects the move with highest power (doesn't switch voluntarily)."""
     
-    def select_action(self, obs: Dict[str, Any], valid_moves: List[Move]) -> int:
+    def select_action(self, obs: Dict[str, Any], valid_moves: List[Move],
+                     available_switches: List[int]) -> int:
         best_idx = 0
         best_power = -1
         
@@ -716,15 +786,37 @@ class GreedyPowerPolicy(Policy):
                 best_idx = i
         
         return best_idx
+    
+    def select_forced_switch(self, obs: Dict[str, Any], 
+                            available_switches: List[int]) -> int:
+        # Pick Pokemon with highest HP
+        team_status = obs["p1_team_status"]
+        best_idx = available_switches[0]
+        best_hp = 0
+        
+        for idx in available_switches:
+            hp = team_status[idx]["hp"]
+            if hp > best_hp:
+                best_hp = hp
+                best_idx = idx
+        
+        return best_idx
 
 
 class GreedyTypePolicy(Policy):
-    """Selects move with best type advantage against opponent."""
+    """Selects move with best type advantage; switches if heavily disadvantaged."""
     
-    def __init__(self, db: PokemonDatabase):
+    def __init__(self, db: PokemonDatabase, switch_threshold: float = 0.3):
+        """
+        Args:
+            db: Pokemon database for type calculations
+            switch_threshold: Switch if best move effectiveness is below this
+        """
         self.db = db
+        self.switch_threshold = switch_threshold
     
-    def select_action(self, obs: Dict[str, Any], valid_moves: List[Move]) -> int:
+    def select_action(self, obs: Dict[str, Any], valid_moves: List[Move],
+                     available_switches: List[int]) -> int:
         # Get opponent types
         opp_types = [PokemonType(t) for t in obs["p2_active"]["types"]]
         
@@ -742,6 +834,30 @@ class GreedyTypePolicy(Policy):
                 best_score = score
                 best_idx = i
         
+        # Consider switching if our best move is weak
+        if available_switches and best_score < self.switch_threshold * 100:
+            # Check if we have a better Pokemon to switch to
+            my_hp_percent = obs["p1_active"]["hp"] / obs["p1_active"]["max_hp"]
+            
+            # If we're low HP and our moves are weak, switch
+            if my_hp_percent < 0.5:
+                return 4 + random.randint(0, len(available_switches) - 1)
+        
+        return best_idx
+    
+    def select_forced_switch(self, obs: Dict[str, Any], 
+                            available_switches: List[int]) -> int:
+        # Pick Pokemon with best type matchup (or highest HP as fallback)
+        team_status = obs["p1_team_status"]
+        best_idx = available_switches[0]
+        best_hp = team_status[best_idx]["hp"]
+        
+        for idx in available_switches:
+            hp = team_status[idx]["hp"]
+            if hp > best_hp:
+                best_hp = hp
+                best_idx = idx
+        
         return best_idx
 
 
@@ -749,20 +865,37 @@ class GreedyTypePolicy(Policy):
 # Example: Starter Battle using real data
 # =========================
 
-def make_starter_battle_env(db: PokemonDatabase, level: int = 10) -> PokemonBattleEnv:
+def make_starter_battle_env(db: PokemonDatabase, level: int = 10, 
+                           team_size: int = 3) -> PokemonBattleEnv:
     """
-    Example: Torchic vs Treecko with real stats & moves.
+    Example battle environment with teams of Pokemon.
 
     You can use any Gen 1-3 Pokémon, e.g.:
     - Gen 1: pikachu, charizard, mewtwo
     - Gen 2: typhlosion, feraligatr, lugia
     - Gen 3: torchic, treecko, rayquaza
+    
+    Args:
+        db: Pokemon database
+        level: Level for all Pokemon
+        team_size: Number of Pokemon per team (1-6)
     """
-    torchic = db.create_pokemon_instance("torchic", level=level)
-    treecko = db.create_pokemon_instance("treecko", level=level)
+    # Example teams - you can customize these!
+    if team_size == 1:
+        team1 = [db.create_pokemon_instance("torchic", level=level)]
+        team2 = [db.create_pokemon_instance("treecko", level=level)]
+    else:
+        # Create diverse teams from different generations
+        team1_species = ["torchic", "pikachu", "cyndaquil", "squirtle", "mudkip", "totodile"]
+        team2_species = ["treecko", "charmander", "chikorita", "bulbasaur", "marshtomp", "croconaw"]
+        
+        team1 = [db.create_pokemon_instance(species, level=level) 
+                for species in team1_species[:team_size]]
+        team2 = [db.create_pokemon_instance(species, level=level) 
+                for species in team2_species[:team_size]]
 
-    t1 = TrainerState(team=[torchic], active_index=0)
-    t2 = TrainerState(team=[treecko], active_index=0)
+    t1 = TrainerState(team=team1, active_index=0)
+    t2 = TrainerState(team=team2, active_index=0)
 
     env = PokemonBattleEnv(db=db, trainer1=t1, trainer2=t2)
     return env
@@ -779,32 +912,61 @@ if __name__ == "__main__":
     db = PokemonDatabase(generations=(1, 2, 3))
     db.load_all()
 
-    # Example: Create battle with Pokemon from different generations
-    # You can now use any Gen 1-3 Pokemon!
-    # Gen 1 examples: pikachu, charizard, mewtwo, snorlax
-    # Gen 2 examples: typhlosion, feraligatr, tyranitar
-    # Gen 3 examples: torchic, treecko, rayquaza
-    
-    env = make_starter_battle_env(db, level=10)
+    # Example: Create battle with teams of Pokemon from different generations
+    # team_size=3 creates teams of 3 Pokemon each
+    env = make_starter_battle_env(db, level=10, team_size=3)
     obs = env.reset()
     
     # Initialize policies - try different ones!
-    # policy1 = RandomPolicy()
+    # policy1 = RandomPolicy(switch_probability=0.2)  # Switches 20% of the time
     # policy1 = GreedyPowerPolicy()
     policy1 = GreedyTypePolicy(db)
-    policy2 = RandomPolicy()
+    policy2 = RandomPolicy(switch_probability=0.15)
     
-    print("Initial observation:")
-    print(f"Player 1 ({obs['p1_active']['name']}) moves: {[m.name for m in env.trainer1.active_pokemon().moves]}")
-    print(f"Player 2 ({obs['p2_active']['name']}) moves: {[m.name for m in env.trainer2.active_pokemon().moves]}")
+    print("=== Battle Start ===")
+    print("\nPlayer 1 Team:")
+    for i, p in enumerate(env.trainer1.team):
+        moves_str = ", ".join([m.name for m in p.moves])
+        print(f"  {i}. {p.species.name} (HP: {p.max_hp}) - Moves: {moves_str}")
+    
+    print("\nPlayer 2 Team:")
+    for i, p in enumerate(env.trainer2.team):
+        moves_str = ", ".join([m.name for m in p.moves])
+        print(f"  {i}. {p.species.name} (HP: {p.max_hp}) - Moves: {moves_str}")
+    
+    print(f"\nStarting: {obs['p1_active']['name']} vs {obs['p2_active']['name']}")
     print()
 
+    # Set policies in environment for forced switch handling
+    env.policy1 = policy1
+    env.policy2 = policy2
+    
     done = False
     step_count = 0
     while not done and step_count < 50:
         # Policies select actions based on observation
-        a_self = policy1.select_action(obs, env.trainer1.active_pokemon().moves)
-        a_opp = policy2.select_action(obs, env.trainer2.active_pokemon().moves)
+        # Include available switches so policy can choose to switch
+        available_switches_p1 = env.trainer1.available_switch_indices()
+        available_switches_p2 = env.trainer2.available_switch_indices()
+        
+        a_self = policy1.select_action(
+            obs, 
+            env.trainer1.active_pokemon().moves,
+            available_switches_p1
+        )
+        
+        # For player 2, swap observations so they see themselves as p1
+        obs_p2 = {
+            "p1_active": obs["p2_active"],
+            "p2_active": obs["p1_active"],
+            "p1_team_status": obs["p2_team_status"],
+            "p2_team_status": obs["p1_team_status"],
+        }
+        a_opp = policy2.select_action(
+            obs_p2,
+            env.trainer2.active_pokemon().moves,
+            available_switches_p2
+        )
         
         obs, reward, done, info = env.step(a_self, a_opp)
 
