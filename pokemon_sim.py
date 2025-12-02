@@ -133,7 +133,7 @@ def api_get(path: str) -> dict:
 
 class PokemonDatabase:
     """
-    Loads Gen 3 data from PokéAPI and provides helpers to instantiate Pokémon.
+    Loads Gen 1-3 data from PokéAPI and provides helpers to instantiate Pokémon.
 
     NOTE: This hits the online API. For heavy training, you should:
       - run once
@@ -141,23 +141,31 @@ class PokemonDatabase:
       - reload from disk in later runs
     """
 
-    GEN3_VERSION_GROUPS = {
+    # Version groups for determining legal moves across Gen 1-3
+    VALID_VERSION_GROUPS = {
+        # Gen 1
+        "red-blue",
+        "yellow",
+        # Gen 2
+        "gold-silver",
+        "crystal",
+        # Gen 3
         "ruby-sapphire",
         "emerald",
         "firered-leafgreen",
     }
 
-    def __init__(self):
-        self.generation_id = 3
+    def __init__(self, generations=(1, 2, 3)):
+        self.generations = generations
         self.species_map: Dict[str, PokemonSpecies] = {}
         self.move_map: Dict[str, Move] = {}
         self.type_chart: Dict[PokemonType, Dict[PokemonType, float]] = {}
 
     # -------- loading top-level --------
     def load_all(self):
-        print("Loading Gen 3 data from PokéAPI...")
+        print(f"Loading Gen {self.generations} data from PokéAPI...")
         self._load_type_chart()
-        self._load_gen3_species_and_moves()
+        self._load_species_and_moves()
         print(f"Loaded {len(self.species_map)} species and {len(self.move_map)} moves.")
 
     # -------- type chart --------
@@ -186,42 +194,49 @@ class PokemonDatabase:
             apply(rel["half_damage_to"], 0.5)
             apply(rel["no_damage_to"], 0.0)
 
-    # -------- generation 3 species & moves --------
-    def _load_gen3_species_and_moves(self):
-        print("Loading Gen 3 generation endpoint...")
-        gen_data = api_get(f"/generation/{self.generation_id}")
-        species_entries = gen_data["pokemon_species"]
-        move_entries = gen_data["moves"]
+    # -------- generation species & moves --------
+    def _load_species_and_moves(self):
+        """Load all species and moves from specified generations."""
+        for gen_id in self.generations:
+            print(f"Loading Gen {gen_id} data...")
+            gen_data = api_get(f"/generation/{gen_id}")
+            species_entries = gen_data["pokemon_species"]
+            move_entries = gen_data["moves"]
 
-        # Load moves first so we can reuse them
-        print("Loading Gen 3 moves...")
-        for m in move_entries:
-            name = m["name"]
-            if name not in self.move_map:
-                mv = self._load_move(name)
-                if mv is None:
+            # Load moves first so we can reuse them
+            print(f"  Loading Gen {gen_id} moves...")
+            for m in move_entries:
+                name = m["name"]
+                if name not in self.move_map:
+                    mv = self._load_move(name)
+                    if mv is None:
+                        continue
+                    self.move_map[name] = mv
+
+            # Load species & stats
+            print(f"  Loading Gen {gen_id} pokemon species...")
+            for s in species_entries:
+                species_name = s["name"]
+                # Skip if already loaded from earlier generation
+                if species_name in self.species_map:
                     continue
-                self.move_map[name] = mv
+                    
+                # The /pokemon/ endpoint uses the same names for basically all species
+                species_detail = api_get(f"/pokemon-species/{species_name}")
 
-        # Load species & stats
-        print("Loading Gen 3 pokemon species...")
-        for s in species_entries:
-            species_name = s["name"]
-            # The /pokemon/ endpoint uses the same names for basically all species
-            species_detail = api_get(f"/pokemon-species/{species_name}")
+                # Find default form (is_default = true)
+                default_variety = None
+                for variety in species_detail["varieties"]:
+                    if variety["is_default"]:
+                        default_variety = variety["pokemon"]["name"]
+                        break
 
-            # Find default form (is_default = true)
-            default_variety = None
-            for variety in species_detail["varieties"]:
-                if variety["is_default"]:
-                    default_variety = variety["pokemon"]["name"]
-                    break
+                if default_variety is None:
+                    print(f"  Warning: No default form found for '{species_name}', skipping.")
+                    continue
 
-            if default_variety is None:
-                raise ValueError(f"No default Pokémon form found for species '{species_name}'")
-
-            poke_data = api_get(f"/pokemon/{default_variety}")
-            self.species_map[species_name] = self._parse_pokemon_species(poke_data)
+                poke_data = api_get(f"/pokemon/{default_variety}")
+                self.species_map[species_name] = self._parse_pokemon_species(poke_data)
 
     def _load_move(self, name: str) -> Move:
         data = api_get(f"/move/{name}")
@@ -270,9 +285,9 @@ class PokemonDatabase:
 
     # -------- helpers for move selection --------
 
-    def get_gen3_legal_moves_for_pokemon(self, pokemon_name: str) -> List[str]:
+    def get_legal_moves_for_pokemon(self, pokemon_name: str) -> List[str]:
         """
-        Returns move names that this Pokémon can learn in Gen 3 version groups.
+        Returns move names that this Pokémon can learn in the loaded generations.
         """
         data = api_get(f"/pokemon/{pokemon_name}")
         legal_moves = []
@@ -281,7 +296,7 @@ class PokemonDatabase:
             vgroups = m["version_group_details"]
             for vgd in vgroups:
                 vg_name = vgd["version_group"]["name"]
-                if vg_name in self.GEN3_VERSION_GROUPS:
+                if vg_name in self.VALID_VERSION_GROUPS:
                     legal_moves.append(move_name)
                     break
         return sorted(set(legal_moves))
@@ -295,10 +310,10 @@ class PokemonDatabase:
     ) -> PokemonInstance:
         """
         Create a PokemonInstance with stats from species_map and moves sampled from
-        Gen 3 legal moves.
+        legal moves in the loaded generations.
 
         move_filter:
-            - None: sample any Gen 3-legal damaging moves
+            - None: sample any legal damaging moves
             - "special": only special moves
             - "physical": only physical moves
         """
@@ -307,7 +322,7 @@ class PokemonDatabase:
             raise ValueError(f"Unknown species '{species_name}' in Gen 3 database.")
 
         species = self.species_map[species_name]
-        legal_move_names = self.get_gen3_legal_moves_for_pokemon(species_name)
+        legal_move_names = self.get_legal_moves_for_pokemon(species_name)
 
         # Build list of Move objects, filter out weird / status moves if desired
         candidate_moves: List[Move] = []
@@ -660,14 +675,88 @@ class PokemonBattleEnv:
 
 
 # =========================
-# Example: Gen 3 Starter Battle using real data
+# Policy Interface
+# =========================
+
+class Policy:
+    """Base class for battle policies."""
+    
+    def select_action(self, obs: Dict[str, Any], valid_moves: List[Move]) -> int:
+        """
+        Select an action (move index 0-3) based on observation.
+        
+        Args:
+            obs: Current battle observation
+            valid_moves: List of available moves for the active Pokemon
+            
+        Returns:
+            Action index (0-3 for moves, 4+ for switches)
+        """
+        raise NotImplementedError
+
+
+class RandomPolicy(Policy):
+    """Randomly selects from available moves."""
+    
+    def select_action(self, obs: Dict[str, Any], valid_moves: List[Move]) -> int:
+        return random.randint(0, min(3, len(valid_moves) - 1))
+
+
+class GreedyPowerPolicy(Policy):
+    """Selects the move with highest power."""
+    
+    def select_action(self, obs: Dict[str, Any], valid_moves: List[Move]) -> int:
+        best_idx = 0
+        best_power = -1
+        
+        for i, move in enumerate(valid_moves):
+            power = move.power if move.power is not None else 0
+            if power > best_power:
+                best_power = power
+                best_idx = i
+        
+        return best_idx
+
+
+class GreedyTypePolicy(Policy):
+    """Selects move with best type advantage against opponent."""
+    
+    def __init__(self, db: PokemonDatabase):
+        self.db = db
+    
+    def select_action(self, obs: Dict[str, Any], valid_moves: List[Move]) -> int:
+        # Get opponent types
+        opp_types = [PokemonType(t) for t in obs["p2_active"]["types"]]
+        
+        best_idx = 0
+        best_score = -1
+        
+        for i, move in enumerate(valid_moves):
+            if move.power is None or move.power == 0:
+                score = 0
+            else:
+                type_mult = self.db.type_multiplier(move.move_type, opp_types)
+                score = move.power * type_mult
+            
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        
+        return best_idx
+
+
+# =========================
+# Example: Starter Battle using real data
 # =========================
 
 def make_starter_battle_env(db: PokemonDatabase, level: int = 10) -> PokemonBattleEnv:
     """
-    Example: Torchic vs Treecko, both real Gen 3 stats & moves.
+    Example: Torchic vs Treecko with real stats & moves.
 
-    You can change to Mudkip / Torchic or whatever you want.
+    You can use any Gen 1-3 Pokémon, e.g.:
+    - Gen 1: pikachu, charizard, mewtwo
+    - Gen 2: typhlosion, feraligatr, lugia
+    - Gen 3: torchic, treecko, rayquaza
     """
     torchic = db.create_pokemon_instance("torchic", level=level)
     treecko = db.create_pokemon_instance("treecko", level=level)
@@ -686,20 +775,37 @@ def make_starter_battle_env(db: PokemonDatabase, level: int = 10) -> PokemonBatt
 if __name__ == "__main__":
     random.seed(67)
 
-    db = PokemonDatabase()
+    # Load all Gen 1-3 Pokemon and moves
+    db = PokemonDatabase(generations=(1, 2, 3))
     db.load_all()
 
+    # Example: Create battle with Pokemon from different generations
+    # You can now use any Gen 1-3 Pokemon!
+    # Gen 1 examples: pikachu, charizard, mewtwo, snorlax
+    # Gen 2 examples: typhlosion, feraligatr, tyranitar
+    # Gen 3 examples: torchic, treecko, rayquaza
+    
     env = make_starter_battle_env(db, level=10)
     obs = env.reset()
+    
+    # Initialize policies - try different ones!
+    # policy1 = RandomPolicy()
+    # policy1 = GreedyPowerPolicy()
+    policy1 = GreedyTypePolicy(db)
+    policy2 = RandomPolicy()
+    
     print("Initial observation:")
-    print(obs)
+    print(f"Player 1 ({obs['p1_active']['name']}) moves: {[m.name for m in env.trainer1.active_pokemon().moves]}")
+    print(f"Player 2 ({obs['p2_active']['name']}) moves: {[m.name for m in env.trainer2.active_pokemon().moves]}")
+    print()
 
     done = False
     step_count = 0
     while not done and step_count < 50:
-        # Dummy policy: both always use move 0
-        a_self = 0
-        a_opp = 0
+        # Policies select actions based on observation
+        a_self = policy1.select_action(obs, env.trainer1.active_pokemon().moves)
+        a_opp = policy2.select_action(obs, env.trainer2.active_pokemon().moves)
+        
         obs, reward, done, info = env.step(a_self, a_opp)
 
         print(f"\n--- Turn {step_count + 1} ---")
